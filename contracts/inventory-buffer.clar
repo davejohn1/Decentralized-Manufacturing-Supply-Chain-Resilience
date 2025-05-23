@@ -1,118 +1,127 @@
-;; Risk Assessment Contract
-;; Identifies potential disruption factors
+;; Inventory Buffer Contract
+;; Tracks strategic reserves
 
 (define-data-var admin principal tx-sender)
 
-;; Risk factor types: 1 = supply, 2 = demand, 3 = logistics, 4 = geopolitical, 5 = environmental
-(define-map risk-factors uint
+;; Inventory levels by entity and product
+(define-map inventory-levels
+  { entity-id: principal, product-id: uint }
   {
-    name: (string-utf8 100),
-    description: (string-utf8 255),
-    risk-type: uint,
-    severity: uint,  ;; 1-10 scale
-    probability: uint,  ;; 1-10 scale
+    current-level: uint,
+    buffer-threshold: uint,
     last-updated: uint
   }
 )
 
-(define-data-var risk-factor-count uint u0)
+;; Alert status: 0 = normal, 1 = warning, 2 = critical
+(define-map buffer-alerts
+  { entity-id: principal, product-id: uint }
+  {
+    status: uint,
+    timestamp: uint
+  }
+)
 
-(define-map entity-risks { entity-id: principal, risk-id: uint } uint) ;; Maps entity to risk score (1-100)
-
-(define-read-only (get-risk-factor (risk-id uint))
+(define-read-only (get-inventory-level (entity-id principal) (product-id uint))
   (default-to
-    {
-      name: u"",
-      description: u"",
-      risk-type: u0,
-      severity: u0,
-      probability: u0,
-      last-updated: u0
-    }
-    (map-get? risk-factors risk-id)
+    { current-level: u0, buffer-threshold: u0, last-updated: u0 }
+    (map-get? inventory-levels { entity-id: entity-id, product-id: product-id })
   )
 )
 
-(define-read-only (get-entity-risk (entity-id principal) (risk-id uint))
-  (default-to u0 (map-get? entity-risks { entity-id: entity-id, risk-id: risk-id }))
+(define-read-only (get-buffer-alert (entity-id principal) (product-id uint))
+  (default-to
+    { status: u0, timestamp: u0 }
+    (map-get? buffer-alerts { entity-id: entity-id, product-id: product-id })
+  )
 )
 
-(define-public (add-risk-factor (name (string-utf8 100)) (description (string-utf8 255)) (risk-type uint) (severity uint) (probability uint))
+(define-public (update-inventory (entity-id principal) (product-id uint) (level uint))
   (begin
-    (asserts! (is-eq tx-sender (var-get admin)) (err u1)) ;; Only admin can add risk factors
-    (asserts! (and (>= severity u1) (<= severity u10)) (err u2)) ;; Severity must be 1-10
-    (asserts! (and (>= probability u1) (<= probability u10)) (err u3)) ;; Probability must be 1-10
-    (asserts! (and (>= risk-type u1) (<= risk-type u5)) (err u4)) ;; Valid risk type
+    (asserts! (or (is-eq tx-sender entity-id) (is-eq tx-sender (var-get admin))) (err u1)) ;; Only entity or admin can update
 
-    (let ((new-risk-id (+ (var-get risk-factor-count) u1)))
-      (var-set risk-factor-count new-risk-id)
-      (ok (map-set risk-factors new-risk-id {
-        name: name,
-        description: description,
-        risk-type: risk-type,
-        severity: severity,
-        probability: probability,
-        last-updated: block-height
-      }))
+    (let
+      (
+        (current-data (get-inventory-level entity-id product-id))
+        (threshold (get buffer-threshold current-data))
+        (alert-status (if (< level threshold) u1 u0))
+        (critical-status (if (< level (/ threshold u2)) u2 alert-status))
+      )
+
+      ;; Update inventory level
+      (map-set inventory-levels
+        { entity-id: entity-id, product-id: product-id }
+        {
+          current-level: level,
+          buffer-threshold: (if (> threshold u0) threshold u100), ;; Default threshold if not set
+          last-updated: block-height
+        }
+      )
+
+      ;; Update alert status if needed
+      (if (> critical-status u0)
+        (map-set buffer-alerts
+          { entity-id: entity-id, product-id: product-id }
+          {
+            status: critical-status,
+            timestamp: block-height
+          }
+        )
+        true
+      )
+
+      (ok true)
     )
   )
 )
 
-(define-public (update-risk-factor (risk-id uint) (severity uint) (probability uint))
+(define-public (set-buffer-threshold (entity-id principal) (product-id uint) (threshold uint))
   (begin
-    (asserts! (is-eq tx-sender (var-get admin)) (err u1)) ;; Only admin can update risk factors
-    (asserts! (is-some (map-get? risk-factors risk-id)) (err u5)) ;; Risk factor must exist
-    (asserts! (and (>= severity u1) (<= severity u10)) (err u2)) ;; Severity must be 1-10
-    (asserts! (and (>= probability u1) (<= probability u10)) (err u3)) ;; Probability must be 1-10
+    (asserts! (or (is-eq tx-sender entity-id) (is-eq tx-sender (var-get admin))) (err u1)) ;; Only entity or admin can set threshold
 
-    (ok (map-set risk-factors risk-id
-      (merge (unwrap-panic (map-get? risk-factors risk-id))
+    (let ((current-data (get-inventory-level entity-id product-id)))
+      (ok (map-set inventory-levels
+        { entity-id: entity-id, product-id: product-id }
         {
-          severity: severity,
-          probability: probability,
+          current-level: (get current-level current-data),
+          buffer-threshold: threshold,
           last-updated: block-height
         }
-      )
+      ))
+    )
+  )
+)
+
+(define-public (clear-alert (entity-id principal) (product-id uint))
+  (begin
+    (asserts! (or (is-eq tx-sender entity-id) (is-eq tx-sender (var-get admin))) (err u1)) ;; Only entity or admin can clear alert
+
+    (ok (map-set buffer-alerts
+      { entity-id: entity-id, product-id: product-id }
+      {
+        status: u0,
+        timestamp: block-height
+      }
     ))
   )
 )
 
-(define-public (assess-entity-risk (entity-id principal) (risk-id uint) (risk-score uint))
-  (begin
-    (asserts! (is-eq tx-sender (var-get admin)) (err u1)) ;; Only admin can assess risk
-    (asserts! (is-some (map-get? risk-factors risk-id)) (err u5)) ;; Risk factor must exist
-    (asserts! (and (>= risk-score u1) (<= risk-score u100)) (err u6)) ;; Risk score must be 1-100
-
-    (ok (map-set entity-risks { entity-id: entity-id, risk-id: risk-id } risk-score))
-  )
-)
-
-(define-read-only (calculate-overall-risk (entity-id principal))
+(define-read-only (check-buffer-status (entity-id principal) (product-id uint))
   (let
     (
-      (risk-count (var-get risk-factor-count))
-      (total-risk u0)
-      (count u0)
+      (inventory-data (get-inventory-level entity-id product-id))
+      (current-level (get current-level inventory-data))
+      (threshold (get buffer-threshold inventory-data))
     )
-    (fold calculate-risk-helper
-      (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
-      { entity-id: entity-id, total: u0, count: u0 })
-  )
-)
-
-(define-private (calculate-risk-helper (risk-id uint) (result { entity-id: principal, total: uint, count: uint }))
-  (let
-    (
-      (entity-id (get entity-id result))
-      (risk-score (get-entity-risk entity-id risk-id))
-    )
-    (if (> risk-score u0)
-      {
-        entity-id: entity-id,
-        total: (+ (get total result) risk-score),
-        count: (+ (get count result) u1)
-      }
-      result
+    (if (> threshold u0)
+      (if (< current-level threshold)
+        (if (< current-level (/ threshold u2))
+          u2  ;; Critical
+          u1  ;; Warning
+        )
+        u0  ;; Normal
+      )
+      u0  ;; No threshold set
     )
   )
 )
